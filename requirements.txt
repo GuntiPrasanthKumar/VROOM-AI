@@ -1,3 +1,5 @@
 sounddevice>=0.5.0
 numpy>=1.24.0
 faster-whisper>=1.0.0
+piper-tts>=1.2.0
+openwakeword>=0.6.0
