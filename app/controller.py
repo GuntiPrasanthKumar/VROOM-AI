@@ -160,7 +160,7 @@ class ActivationController:
 
         def on_wake_frame(score: float) -> None:
             if score >= 0.15 and self.dev_mode:
-                print(f"\r[WAKE] Hearing candidate phrase... (Confidence: {score:.2f})  ", end="", flush=True)
+                print(f"\r[WAKE] Hearing wake phrase candidate... (Confidence: {score:.2f}){' '*15}", end="", flush=True)
 
         t_wake_start = time.perf_counter()
         wake_detected = self.wake_detector.listen(
@@ -172,7 +172,7 @@ class ActivationController:
         # Timeout: Wake phrase was NOT spoken
         if not wake_detected:
             if self.dev_mode:
-                print(f"\n[TIMEOUT] No wake phrase detected within {effective_wake_timeout}s. Returning to standby.")
+                print(f"\r[TIMEOUT] No wake phrase detected within {effective_wake_timeout}s. Returning to standby.{' '*20}\n", flush=True)
             fallback_state = AssistantState.WAITING_FOR_WAKE_WORD if self.mode == "wake_only" else AssistantState.WAITING_FOR_CLAP
             self._set_state(fallback_state)
             return {
@@ -183,7 +183,7 @@ class ActivationController:
                 "final_state": self._state.value,
             }
 
-        print("\n[WAKE] Wake phrase detected! 🎯")
+        print(f"\r[WAKE] Wake phrase detected! 🎯{' '*35}\n", flush=True)
 
         # =====================================================================
         # STAGE 3: ACTIVATED (Double gate satisfied, prepare command capture)

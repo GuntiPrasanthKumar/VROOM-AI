@@ -20,9 +20,9 @@ class ClapDetector:
     def __init__(
         self,
         threshold: float = 0.03,
-        min_crest_factor: float = 3.6,
-        min_onset_ratio: float = 3.5,
-        max_decay_ratio: float = 0.50,
+        min_crest_factor: float = 3.0,
+        min_onset_ratio: float = 3.2,
+        max_decay_ratio: float = 0.60,
         max_decay_peak: float = 0.28,
         debounce_seconds: float = 0.6,
         device_index: Optional[int] = None,
@@ -34,7 +34,7 @@ class ClapDetector:
             threshold: Minimum peak amplitude [0.0 to 1.0] for the clap candidate.
                        Calibrated to 0.03 for real laptop/desktop digital microphones.
             min_crest_factor: Minimum peak-to-RMS ratio indicating impulsive transient.
-                              Speech vowels are 1.4-2.5; claps are 3.6+.
+                              Speech vowels are 1.4-2.5; real physical claps are 3.0+.
             min_onset_ratio: Minimum ratio of candidate peak to preceding frame RMS.
             max_decay_ratio: Maximum ratio of subsequent frame peak to candidate peak.
             max_decay_peak: Maximum peak amplitude permitted in the subsequent frame.
@@ -115,11 +115,11 @@ class ClapDetector:
         if self._candidate_pending:
             self._candidate_pending = False
             # Check acoustic decay:
-            # 1. Peak drops sharply compared to candidate peak (or dropped below baseline)
+            # 1. Peak drops sharply compared to candidate peak (or dropped below quiet floor)
             # 2. RMS does not explode into a sustained speech vowel
             decayed = (
-                (peak_amp <= self._candidate_peak * self.max_decay_ratio or peak_amp <= 0.015)
-                and (rms_energy <= self._candidate_rms * 1.3 and rms_energy < 0.035)
+                (peak_amp <= self._candidate_peak * self.max_decay_ratio or peak_amp <= 0.020)
+                and (rms_energy <= max(self._candidate_rms * 1.5, 0.020) and rms_energy < 0.038)
                 and peak_amp <= self.max_decay_peak
             )
             if decayed:
@@ -168,6 +168,8 @@ class ClapDetector:
         """
         start_time = time.time()
         self.reset()
+        candidate_active = False
+        last_meter_time = 0.0
 
         try:
             with sd.InputStream(
@@ -184,12 +186,26 @@ class ClapDetector:
                     if on_frame is not None:
                         on_frame(metrics)
 
+                    now = time.time()
                     if self.feedback:
                         peak = metrics["peak"]
                         if is_clap:
-                            print(f"\r[CLAP] 👏 Physical clap detected! (Peak: {peak:.3f}, Crest: {metrics['crest_factor']:.1f})")
+                            print(f"\r[CLAP] 👏 Physical clap detected! (Peak: {peak:.3f}, Crest: {metrics['crest_factor']:.1f}){' '*25}\n", flush=True)
+                            candidate_active = False
                         elif self._candidate_pending:
-                            print(f"\r[MIC] Sharp transient caught (Peak: {peak:.3f}) -> Verifying decay...", end="", flush=True)
+                            print(f"\r[MIC] Sharp transient caught (Peak: {peak:.3f}) ──> Checking decay...{' '*15}", end="", flush=True)
+                            candidate_active = True
+                        elif candidate_active:
+                            # Candidate check completed in 32ms and was rejected: immediately clear the prompt!
+                            candidate_active = False
+                            print(f"\r[STATE] Waiting for clap...{' '*50}", end="", flush=True)
+                        elif peak > 0.015 and (now - last_meter_time) > 0.15:
+                            last_meter_time = now
+                            bar = "#" * int(min(peak * 120, 20))
+                            print(f"\r[STATE] Waiting for clap... [Audio: {peak:.3f} {bar:<20}]", end="", flush=True)
+                        elif (now - last_meter_time) > 0.8:
+                            last_meter_time = now
+                            print(f"\r[STATE] Waiting for clap...{' '*40}", end="", flush=True)
 
                     if is_clap:
                         return True

@@ -78,7 +78,7 @@ def run_tests() -> bool:
     synth_chrome, sr_cr = tts.synthesize("Open Chrome")
     cmd_chrome_16k = resample_to_16k(synth_chrome, orig_sr=sr_cr)
 
-    synth_exit, sr_ex = tts.synthesize("Exit VROOM")
+    synth_exit, sr_ex = tts.synthesize("Exit assistant")
     cmd_exit_16k = resample_to_16k(synth_exit, orig_sr=sr_ex)
 
     # Pure silence
