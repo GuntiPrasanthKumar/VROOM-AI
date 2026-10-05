@@ -39,8 +39,9 @@ class ActivationController:
         clap_detector: Optional[ClapDetector] = None,
         wake_detector: Optional[WakeWordDetector] = None,
         wake_model_name: str = "hey_jarvis",
-        wake_threshold: float = 0.5,
-        wake_timeout: float = 5.0,
+        wake_threshold: float = 0.42,
+        wake_timeout: float = 6.0,
+        mode: str = "staged",
         dev_mode: bool = True,
         on_state_change: Optional[Callable[[AssistantState, AssistantState], None]] = None,
     ) -> None:
@@ -53,23 +54,27 @@ class ActivationController:
             wake_model_name: Default wake-word model name ('hey_jarvis').
             wake_threshold: Confidence threshold for wake-word activation (0.0 to 1.0).
             wake_timeout: Time in seconds to wait for the wake phrase after a clap before timing out.
+            mode: Activation mode - 'staged' (Clap + Wake phrase) or 'wake_only' (Direct wake phrase).
             dev_mode: Whether to print diagnostic development logs.
             on_state_change: Optional callback invoked on state transitions.
         """
         self.dev_mode = dev_mode
+        self.mode = mode.lower().strip()
         self.wake_timeout = wake_timeout
         self.on_state_change = on_state_change
 
         # Initialize underlying subsystems
         self.orchestrator = orchestrator or AssistantOrchestrator(dev_mode=dev_mode)
-        self.clap_detector = clap_detector or ClapDetector()
+        self.clap_detector = clap_detector or ClapDetector(feedback=dev_mode)
         self.wake_detector = wake_detector or WakeWordDetector(
             model_name=wake_model_name,
             threshold=wake_threshold,
         )
 
         # Initial state
-        self._state: AssistantState = AssistantState.WAITING_FOR_CLAP
+        self._state: AssistantState = (
+            AssistantState.WAITING_FOR_WAKE_WORD if self.mode == "wake_only" else AssistantState.WAITING_FOR_CLAP
+        )
 
     @property
     def state(self) -> AssistantState:
@@ -99,65 +104,86 @@ class ActivationController:
         wake_timeout: Optional[float] = None,
         command_duration: float = 4.0,
     ) -> Dict[str, Any]:
-        """Execute one complete two-stage lifecycle cycle:
+        """Execute one complete lifecycle cycle according to the configured mode.
+
+        In 'staged' mode:
         WAITING_FOR_CLAP -> WAITING_FOR_WAKE_WORD -> ACTIVATED -> LISTENING -> PROCESSING -> EXECUTING -> RESPONDING -> WAITING_FOR_CLAP.
+
+        In 'wake_only' mode:
+        WAITING_FOR_WAKE_WORD -> ACTIVATED -> LISTENING -> PROCESSING -> EXECUTING -> RESPONDING -> WAITING_FOR_WAKE_WORD.
 
         Returns:
             Dictionary containing timing metrics, transcription, result, and exit status.
         """
         metrics: Dict[str, float] = {}
         t_cycle_start = time.perf_counter()
-        effective_wake_timeout = wake_timeout if wake_timeout is not None else self.wake_timeout
+        effective_wake_timeout = wake_timeout if wake_timeout is not None else (
+            self.wake_timeout if self.mode == "staged" else None
+        )
 
         # =====================================================================
-        # STAGE 1: WAITING_FOR_CLAP (Microphone owned by ClapDetector)
+        # STAGE 1: WAITING_FOR_CLAP (Only in staged mode)
         # =====================================================================
-        self._set_state(AssistantState.WAITING_FOR_CLAP)
-        if self.dev_mode:
-            print("[STATE] Waiting for clap...")
-
-        t_clap_start = time.perf_counter()
-        clap_detected = self.clap_detector.listen(timeout_seconds=clap_timeout)
-        metrics["clap_detection"] = round(time.perf_counter() - t_clap_start, 3)
-
-        if not clap_detected:
+        if self.mode == "staged":
+            self._set_state(AssistantState.WAITING_FOR_CLAP)
             if self.dev_mode:
-                print("[STATE] Clap listening timed out.")
-            return {
-                "clap_detected": False,
-                "wake_detected": False,
-                "should_exit": False,
-                "metrics": metrics,
-                "final_state": self._state.value,
-            }
+                print("[STATE] Waiting for clap...")
 
-        print("[CLAP] Detected!")
+            t_clap_start = time.perf_counter()
+            clap_detected = self.clap_detector.listen(timeout_seconds=clap_timeout)
+            metrics["clap_detection"] = round(time.perf_counter() - t_clap_start, 3)
+
+            if not clap_detected:
+                if self.dev_mode:
+                    print("[STATE] Clap listening timed out.")
+                return {
+                    "clap_detected": False,
+                    "wake_detected": False,
+                    "should_exit": False,
+                    "metrics": metrics,
+                    "final_state": self._state.value,
+                }
+
+            # Brief pause to let acoustic reverberation clear and release mic stream cleanly
+            time.sleep(0.1)
+        else:
+            clap_detected = True
+            metrics["clap_detection"] = 0.0
 
         # =====================================================================
         # STAGE 2: WAITING_FOR_WAKE_WORD (Microphone owned by WakeWordDetector)
         # =====================================================================
         self._set_state(AssistantState.WAITING_FOR_WAKE_WORD)
         if self.dev_mode:
-            print(f"[STATE] Listening for wake phrase ('{self.wake_detector.model_name}', timeout: {effective_wake_timeout}s)...")
+            tout_str = f"{effective_wake_timeout}s" if effective_wake_timeout is not None else "continuous"
+            print(f"[STATE] Listening for wake phrase ('{self.wake_detector.model_name}', timeout: {tout_str})...")
+
+        def on_wake_frame(score: float) -> None:
+            if score >= 0.15 and self.dev_mode:
+                print(f"\r[WAKE] Hearing candidate phrase... (Confidence: {score:.2f})  ", end="", flush=True)
 
         t_wake_start = time.perf_counter()
-        wake_detected = self.wake_detector.listen(timeout_seconds=effective_wake_timeout)
+        wake_detected = self.wake_detector.listen(
+            timeout_seconds=effective_wake_timeout,
+            on_frame=on_wake_frame,
+        )
         metrics["wake_detection"] = round(time.perf_counter() - t_wake_start, 3)
 
-        # Timeout: Wake phrase was NOT spoken after clap
+        # Timeout: Wake phrase was NOT spoken
         if not wake_detected:
             if self.dev_mode:
-                print(f"[TIMEOUT] No wake phrase detected within {effective_wake_timeout}s. Returning to standby.")
-            self._set_state(AssistantState.WAITING_FOR_CLAP)
+                print(f"\n[TIMEOUT] No wake phrase detected within {effective_wake_timeout}s. Returning to standby.")
+            fallback_state = AssistantState.WAITING_FOR_WAKE_WORD if self.mode == "wake_only" else AssistantState.WAITING_FOR_CLAP
+            self._set_state(fallback_state)
             return {
-                "clap_detected": True,
+                "clap_detected": clap_detected,
                 "wake_detected": False,
                 "should_exit": False,
                 "metrics": metrics,
                 "final_state": self._state.value,
             }
 
-        print("[WAKE] Wake phrase detected!")
+        print("\n[WAKE] Wake phrase detected! 🎯")
 
         # =====================================================================
         # STAGE 3: ACTIVATED (Double gate satisfied, prepare command capture)
@@ -210,10 +236,11 @@ class ActivationController:
             metrics["tts"] = round(time.perf_counter() - t_tts_start, 3)
             metrics["total_interaction"] = round(time.perf_counter() - t_cycle_start, 3)
 
-            # Return to WAITING_FOR_CLAP
-            self._set_state(AssistantState.WAITING_FOR_CLAP)
+            # Return to standby
+            fallback_state = AssistantState.WAITING_FOR_WAKE_WORD if self.mode == "wake_only" else AssistantState.WAITING_FOR_CLAP
+            self._set_state(fallback_state)
             return {
-                "clap_detected": True,
+                "clap_detected": clap_detected,
                 "wake_detected": True,
                 "transcription": "",
                 "intent": "timeout",
@@ -301,14 +328,16 @@ class ActivationController:
         metrics["total_interaction"] = round(time.perf_counter() - t_cycle_start, 3)
 
         # =====================================================================
-        # CYCLE COMPLETE: Return to WAITING_FOR_CLAP
+        # CYCLE COMPLETE: Return to standby state
         # =====================================================================
-        self._set_state(AssistantState.WAITING_FOR_CLAP)
+        fallback_state = AssistantState.WAITING_FOR_WAKE_WORD if self.mode == "wake_only" else AssistantState.WAITING_FOR_CLAP
+        self._set_state(fallback_state)
         if self.dev_mode:
-            print("[STATE] Waiting for clap...")
+            standby_msg = "[STATE] Waiting for 'Hey Jarvis'..." if self.mode == "wake_only" else "[STATE] Waiting for clap..."
+            print(standby_msg)
 
         return {
-            "clap_detected": True,
+            "clap_detected": clap_detected,
             "wake_detected": True,
             "transcription": clean_text,
             "intent": intent,
@@ -512,13 +541,19 @@ class ActivationController:
         }
 
     def run(self, command_duration: float = 4.0) -> None:
-        """Run the continuous two-stage activation loop until interrupted or exit."""
+        """Run the continuous activation loop until interrupted or exit."""
         print("=" * 65)
-        print("     VROOM AI — Staged Activation Mode (Clap + Wake Word)")
-        print("=" * 65)
-        print("Activation Gate 1: 👏 Physical Acoustic Clap")
-        print(f"Activation Gate 2: Spoken Wake Phrase ('Hey Jarvis', timeout: {self.wake_timeout}s)")
-        print("Status           : [STATE] Waiting for clap...")
+        if self.mode == "wake_only":
+            print("     VROOM AI — Direct Wake-Word Mode ('Hey Jarvis')")
+            print("=" * 65)
+            print("Activation Gate  : 🗣️ Spoken Wake Phrase ('Hey Jarvis')")
+            print("Standby Status   : [STATE] Waiting for 'Hey Jarvis'...")
+        else:
+            print("     VROOM AI — Staged Activation Mode (Clap + Wake Word)")
+            print("=" * 65)
+            print("Activation Gate 1: 👏 Physical Acoustic Clap")
+            print(f"Activation Gate 2: 🗣️ Spoken Wake Phrase ('Hey Jarvis', timeout: {self.wake_timeout}s)")
+            print("Standby Status   : [STATE] Waiting for clap...")
         print("=" * 65)
 
         try:
@@ -529,5 +564,6 @@ class ActivationController:
                     break
         except KeyboardInterrupt:
             print("\n[CONTROLLER] Interrupted by user. Exiting cleanly.")
-            self._set_state(AssistantState.WAITING_FOR_CLAP)
+            standby = AssistantState.WAITING_FOR_WAKE_WORD if self.mode == "wake_only" else AssistantState.WAITING_FOR_CLAP
+            self._set_state(standby)
             self.orchestrator._speak("Goodbye.")

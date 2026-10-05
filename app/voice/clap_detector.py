@@ -19,41 +19,54 @@ class ClapDetector:
 
     def __init__(
         self,
-        threshold: float = 0.40,
-        min_crest_factor: float = 3.8,
-        min_onset_ratio: float = 10.0,
+        threshold: float = 0.03,
+        min_crest_factor: float = 3.6,
+        min_onset_ratio: float = 3.5,
+        max_decay_ratio: float = 0.50,
         max_decay_peak: float = 0.28,
         debounce_seconds: float = 0.6,
         device_index: Optional[int] = None,
+        feedback: bool = True,
     ) -> None:
         """Initialize the clap detector.
 
         Args:
             threshold: Minimum peak amplitude [0.0 to 1.0] for the clap candidate.
+                       Calibrated to 0.03 for real laptop/desktop digital microphones.
             min_crest_factor: Minimum peak-to-RMS ratio indicating impulsive transient.
+                              Speech vowels are 1.4-2.5; claps are 3.6+.
             min_onset_ratio: Minimum ratio of candidate peak to preceding frame RMS.
-            max_decay_peak: Maximum peak amplitude permitted in the subsequent frame
-                            (claps decay within 30-50ms; speech vowels sustain energy).
+            max_decay_ratio: Maximum ratio of subsequent frame peak to candidate peak.
+            max_decay_peak: Maximum peak amplitude permitted in the subsequent frame.
             debounce_seconds: Minimum delay between consecutive claps to prevent double triggers.
             device_index: Optional sounddevice input device index. None uses default input.
+            feedback: Whether to display live console feedback on audio transients.
         """
         self.threshold = threshold
         self.min_crest_factor = min_crest_factor
         self.min_onset_ratio = min_onset_ratio
+        self.max_decay_ratio = max_decay_ratio
         self.max_decay_peak = max_decay_peak
         self.debounce_seconds = debounce_seconds
         self.device_index = device_index
+        self.feedback = feedback
 
         self._last_clap_time: float = 0.0
-        self._prev_rms: float = 0.005
+        self._prev_rms: float = 0.002
+        self._running_noise: float = 0.002
         self._candidate_pending: bool = False
+        self._candidate_peak: float = 0.0
+        self._candidate_rms: float = 0.0
         self._candidate_metrics: Dict[str, float] = {}
 
     def reset(self) -> None:
         """Reset internal history and candidate state."""
         self._last_clap_time = 0.0
-        self._prev_rms = 0.005
+        self._prev_rms = 0.002
+        self._running_noise = 0.002
         self._candidate_pending = False
+        self._candidate_peak = 0.0
+        self._candidate_rms = 0.0
         self._candidate_metrics = {}
 
     def process_frame(self, frame: np.ndarray) -> Tuple[bool, Dict[str, float]]:
@@ -84,6 +97,10 @@ class ClapDetector:
         crest_factor = peak_amp / (rms_energy + 1e-6)
         onset_ratio = peak_amp / (self._prev_rms + 1e-5)
 
+        # Update smooth ambient noise floor tracking (only when quiet)
+        if peak_amp < 0.02:
+            self._running_noise = 0.95 * self._running_noise + 0.05 * rms_energy
+
         now = time.time()
         is_clap = False
         metrics = {
@@ -97,21 +114,37 @@ class ClapDetector:
         # Step 2: If a candidate was pending from previous frame, verify decay!
         if self._candidate_pending:
             self._candidate_pending = False
-            # If the current frame decayed as expected for a transient clap
-            if peak_amp <= self.max_decay_peak:
+            # Check acoustic decay:
+            # 1. Peak drops sharply compared to candidate peak (or dropped below baseline)
+            # 2. RMS does not explode into a sustained speech vowel
+            decayed = (
+                (peak_amp <= self._candidate_peak * self.max_decay_ratio or peak_amp <= 0.015)
+                and (rms_energy <= self._candidate_rms * 1.3 and rms_energy < 0.035)
+                and peak_amp <= self.max_decay_peak
+            )
+            if decayed:
                 if (now - self._last_clap_time) >= self.debounce_seconds:
                     is_clap = True
                     self._last_clap_time = now
                     metrics["confirmed"] = True
+            elif peak_amp > self._candidate_peak and crest_factor >= self.min_crest_factor:
+                # The clap impulse peak straddled the frame boundary; update candidate
+                self._candidate_pending = True
+                self._candidate_peak = peak_amp
+                self._candidate_rms = rms_energy
 
         # Step 1: Check if the current frame is an onset candidate
+        effective_threshold = max(self.threshold, self._running_noise * 3.5)
         if (
-            peak_amp >= self.threshold
+            not is_clap
+            and not self._candidate_pending
+            and peak_amp >= effective_threshold
             and crest_factor >= self.min_crest_factor
             and onset_ratio >= self.min_onset_ratio
-            and self._prev_rms < 0.06
         ):
             self._candidate_pending = True
+            self._candidate_peak = peak_amp
+            self._candidate_rms = rms_energy
             self._candidate_metrics = metrics
 
         self._prev_rms = rms_energy
@@ -150,6 +183,13 @@ class ClapDetector:
 
                     if on_frame is not None:
                         on_frame(metrics)
+
+                    if self.feedback:
+                        peak = metrics["peak"]
+                        if is_clap:
+                            print(f"\r[CLAP] 👏 Physical clap detected! (Peak: {peak:.3f}, Crest: {metrics['crest_factor']:.1f})")
+                        elif self._candidate_pending:
+                            print(f"\r[MIC] Sharp transient caught (Peak: {peak:.3f}) -> Verifying decay...", end="", flush=True)
 
                     if is_clap:
                         return True
