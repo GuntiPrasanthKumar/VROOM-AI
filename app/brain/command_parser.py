@@ -96,7 +96,7 @@ class CommandParser:
         lower_text = normalized.lower()
 
         # 1. Check for Exit Assistant commands
-        if lower_text in self.EXIT_KEYWORDS:
+        if lower_text in self.EXIT_KEYWORDS or lower_text.startswith(("quit", "exit", "stop", "shut down", "power down", "bye")):
             return ParsedCommand(
                 intent="exit_assistant",
                 entity=None,
