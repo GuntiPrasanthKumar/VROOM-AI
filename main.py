@@ -24,12 +24,13 @@ def main() -> int:
     print("        VROOM AI — Intelligent Desktop Voice Assistant")
     print("=" * 65)
     print(f"Python Runtime : {platform.python_version()} on {platform.system()} {platform.release()}")
-    print("Wake Engine    : OpenWakeWord ('Hey Jarvis') [Local]")
+    print("Activation 1   : 👏 Physical Acoustic Clap Detector [Local]")
+    print("Activation 2   : OpenWakeWord ('Hey Jarvis') [Local]")
     print("Brain Engine   : Ollama (llama3.2:1b) [Local]")
     print("Speech-to-Text : Faster-Whisper (base, int8) [Local]")
     print("Text-to-Speech : Piper TTS (en_US-lessac-medium) [Local]")
     print("Security Mode  : Strict Tool Router & Sandboxed Workspace")
-    print("Lifecycle Mode : State Machine (WAITING -> ACTIVATED -> EXECUTE -> WAITING)")
+    print("Lifecycle Mode : Staged (CLAP -> WAKE -> LISTEN -> EXECUTE -> CLAP)")
     print("=" * 65)
 
     try:

@@ -1,11 +1,10 @@
 """Activation Controller and State Machine for VROOM AI.
 
-Coordinates the transition between low-power Wake-Word monitoring and
-full conversational execution:
-WAITING -> ACTIVATED -> LISTENING -> PROCESSING -> EXECUTING -> RESPONDING -> WAITING.
+Coordinates the staged activation sequence:
+WAITING_FOR_CLAP -> WAITING_FOR_WAKE_WORD -> ACTIVATED -> LISTENING -> PROCESSING -> EXECUTING -> RESPONDING -> WAITING_FOR_CLAP.
 
-Enforces strict microphone ownership, prevents device contention,
-and maintains the security boundaries of the Tool Router.
+Enforces strict sequential microphone ownership to avoid audio device conflicts,
+handles activation timeouts, and preserves the Tool Router security boundary.
 """
 
 from enum import Enum
@@ -15,29 +14,33 @@ import numpy as np
 
 from app.orchestrator import AssistantOrchestrator
 from app.tools.base import ToolResult
+from app.voice.clap_detector import ClapDetector
 from app.voice.wake_word import WakeWordDetector
 
 
 class AssistantState(str, Enum):
     """Explicit lifecycle states for VROOM AI."""
 
-    WAITING = "WAITING"          # Low-power monitoring of audio for wake phrase
-    ACTIVATED = "ACTIVATED"      # Wake word confirmed; activation cue presented
-    LISTENING = "LISTENING"      # Microphone actively capturing single user command
-    PROCESSING = "PROCESSING"    # STT transcription and LLM semantic understanding
-    EXECUTING = "EXECUTING"      # Tool Router vetting and safe tool invocation
-    RESPONDING = "RESPONDING"    # Piper TTS speaking natural language feedback
+    WAITING_FOR_CLAP = "WAITING_FOR_CLAP"              # Standby: Monitoring for physical acoustic clap
+    WAITING_FOR_WAKE_WORD = "WAITING_FOR_WAKE_WORD"    # Gated: Monitoring for spoken wake phrase with timeout
+    ACTIVATED = "ACTIVATED"                            # Double-gate confirmed: Providing activation cue
+    LISTENING = "LISTENING"                            # Microphone recording user command
+    PROCESSING = "PROCESSING"                          # Whisper STT & Ollama LLM understanding
+    EXECUTING = "EXECUTING"                            # Tool Router validation and execution
+    RESPONDING = "RESPONDING"                          # Piper TTS speaking output
 
 
 class ActivationController:
-    """Manages the state machine and coordinates Wake-Word with the Assistant pipeline."""
+    """Manages the two-stage (Clap + Wake Word) activation state machine."""
 
     def __init__(
         self,
         orchestrator: Optional[AssistantOrchestrator] = None,
+        clap_detector: Optional[ClapDetector] = None,
         wake_detector: Optional[WakeWordDetector] = None,
         wake_model_name: str = "hey_jarvis",
         wake_threshold: float = 0.5,
+        wake_timeout: float = 5.0,
         dev_mode: bool = True,
         on_state_change: Optional[Callable[[AssistantState, AssistantState], None]] = None,
     ) -> None:
@@ -45,24 +48,28 @@ class ActivationController:
 
         Args:
             orchestrator: AssistantOrchestrator instance (manages STT, LLM, Router, TTS).
+            clap_detector: ClapDetector instance (evaluates transient acoustic spikes).
             wake_detector: WakeWordDetector instance (manages OpenWakeWord).
             wake_model_name: Default wake-word model name ('hey_jarvis').
             wake_threshold: Confidence threshold for wake-word activation (0.0 to 1.0).
+            wake_timeout: Time in seconds to wait for the wake phrase after a clap before timing out.
             dev_mode: Whether to print diagnostic development logs.
             on_state_change: Optional callback invoked on state transitions.
         """
         self.dev_mode = dev_mode
+        self.wake_timeout = wake_timeout
         self.on_state_change = on_state_change
 
         # Initialize underlying subsystems
         self.orchestrator = orchestrator or AssistantOrchestrator(dev_mode=dev_mode)
+        self.clap_detector = clap_detector or ClapDetector()
         self.wake_detector = wake_detector or WakeWordDetector(
             model_name=wake_model_name,
             threshold=wake_threshold,
         )
 
         # Initial state
-        self._state: AssistantState = AssistantState.WAITING
+        self._state: AssistantState = AssistantState.WAITING_FOR_CLAP
 
     @property
     def state(self) -> AssistantState:
@@ -74,57 +81,86 @@ class ActivationController:
         old_state = self._state
         self._state = new_state
         if self.dev_mode:
-            print(f"\n[STATE TRANSITION] {old_state.value} ──> {new_state.value}")
+            print(f"\n[STATE] {old_state.value} ──> {new_state.value}")
         if self.on_state_change is not None:
             self.on_state_change(old_state, new_state)
 
     def _play_activation_cue(self) -> None:
-        """Provide a brief, non-intrusive activation cue to indicate readiness."""
-        print("[ACTIVATED] Wake word detected! Listening for command...")
-        # Brief friendly spoken cue
+        """Provide a brief activation cue indicating VROOM is listening for a command."""
+        print("[STATE] VROOM activated. Listening for command...")
         try:
             self.orchestrator.tts.speak("Listening...", blocking=True)
         except Exception:
-            # Fall back to silent/visual cue if audio device is unavailable
             pass
 
     def run_cycle(
         self,
+        clap_timeout: Optional[float] = None,
         wake_timeout: Optional[float] = None,
         command_duration: float = 4.0,
     ) -> Dict[str, Any]:
-        """Execute one complete lifecycle cycle:
-        WAITING -> ACTIVATED -> LISTENING -> PROCESSING -> EXECUTING -> RESPONDING -> WAITING.
+        """Execute one complete two-stage lifecycle cycle:
+        WAITING_FOR_CLAP -> WAITING_FOR_WAKE_WORD -> ACTIVATED -> LISTENING -> PROCESSING -> EXECUTING -> RESPONDING -> WAITING_FOR_CLAP.
 
         Returns:
             Dictionary containing timing metrics, transcription, result, and exit status.
         """
         metrics: Dict[str, float] = {}
         t_cycle_start = time.perf_counter()
+        effective_wake_timeout = wake_timeout if wake_timeout is not None else self.wake_timeout
 
         # =====================================================================
-        # STATE 1: WAITING (Microphone owned by WakeWordDetector)
+        # STAGE 1: WAITING_FOR_CLAP (Microphone owned by ClapDetector)
         # =====================================================================
-        self._set_state(AssistantState.WAITING)
+        self._set_state(AssistantState.WAITING_FOR_CLAP)
         if self.dev_mode:
-            print(f"[WAITING] Monitoring audio for wake word '{self.wake_detector.model_name}'...")
+            print("[STATE] Waiting for clap...")
 
-        t_wake_start = time.perf_counter()
-        wake_detected = self.wake_detector.listen(timeout_seconds=wake_timeout)
-        metrics["wake_detection"] = round(time.perf_counter() - t_wake_start, 3)
+        t_clap_start = time.perf_counter()
+        clap_detected = self.clap_detector.listen(timeout_seconds=clap_timeout)
+        metrics["clap_detection"] = round(time.perf_counter() - t_clap_start, 3)
 
-        if not wake_detected:
+        if not clap_detected:
             if self.dev_mode:
-                print(f"[WAITING] Wake-word listening timed out after {wake_timeout}s.")
+                print("[STATE] Clap listening timed out.")
             return {
+                "clap_detected": False,
                 "wake_detected": False,
                 "should_exit": False,
                 "metrics": metrics,
                 "final_state": self._state.value,
             }
 
+        print("[CLAP] Detected!")
+
         # =====================================================================
-        # STATE 2: ACTIVATED (Microphone released by WakeWordDetector)
+        # STAGE 2: WAITING_FOR_WAKE_WORD (Microphone owned by WakeWordDetector)
+        # =====================================================================
+        self._set_state(AssistantState.WAITING_FOR_WAKE_WORD)
+        if self.dev_mode:
+            print(f"[STATE] Listening for wake phrase ('{self.wake_detector.model_name}', timeout: {effective_wake_timeout}s)...")
+
+        t_wake_start = time.perf_counter()
+        wake_detected = self.wake_detector.listen(timeout_seconds=effective_wake_timeout)
+        metrics["wake_detection"] = round(time.perf_counter() - t_wake_start, 3)
+
+        # Timeout: Wake phrase was NOT spoken after clap
+        if not wake_detected:
+            if self.dev_mode:
+                print(f"[TIMEOUT] No wake phrase detected within {effective_wake_timeout}s. Returning to standby.")
+            self._set_state(AssistantState.WAITING_FOR_CLAP)
+            return {
+                "clap_detected": True,
+                "wake_detected": False,
+                "should_exit": False,
+                "metrics": metrics,
+                "final_state": self._state.value,
+            }
+
+        print("[WAKE] Wake phrase detected!")
+
+        # =====================================================================
+        # STAGE 3: ACTIVATED (Double gate satisfied, prepare command capture)
         # =====================================================================
         self._set_state(AssistantState.ACTIVATED)
         t_act_start = time.perf_counter()
@@ -132,21 +168,21 @@ class ActivationController:
         metrics["activation_cue"] = round(time.perf_counter() - t_act_start, 3)
 
         # =====================================================================
-        # STATE 3: LISTENING (Microphone owned by AudioRecorder)
+        # STAGE 4: LISTENING (Microphone owned by AudioRecorder)
         # =====================================================================
         self._set_state(AssistantState.LISTENING)
-        print(f"[LISTENING] Speak command now ({command_duration:.1f}s)...")
+        print(f"[STATE] Listening for command ({command_duration:.1f}s)... Speak now!")
 
         t_rec_start = time.perf_counter()
         command_audio = self.orchestrator.recorder.record(duration_seconds=command_duration)
         metrics["command_recording"] = round(time.perf_counter() - t_rec_start, 3)
 
         # =====================================================================
-        # STATE 4: PROCESSING (STT Transcription & LLM Understanding)
+        # STAGE 5: PROCESSING (STT Transcription & LLM Understanding)
         # =====================================================================
         self._set_state(AssistantState.PROCESSING)
 
-        # Step 4a: Speech-to-Text
+        # 5a: Speech-to-Text
         t_stt_start = time.perf_counter()
         try:
             transcription, stt_meta = self.orchestrator.stt.transcribe(command_audio)
@@ -160,9 +196,9 @@ class ActivationController:
         clean_text = transcription.strip() if transcription else ""
 
         if self.dev_mode:
-            print(f"[PROCESSING] Transcription: \"{clean_text}\" (took {metrics['stt']}s)")
+            print(f"[STT] Transcription: \"{clean_text}\" (took {metrics['stt']}s)")
 
-        # Handle Timeout / Silence: No speech detected in recording
+        # Handle Timeout / Silence: No speech detected
         if not clean_text:
             if self.dev_mode:
                 print("[PROCESSING] No speech detected in command recording (silence/timeout).")
@@ -174,9 +210,10 @@ class ActivationController:
             metrics["tts"] = round(time.perf_counter() - t_tts_start, 3)
             metrics["total_interaction"] = round(time.perf_counter() - t_cycle_start, 3)
 
-            # Return to WAITING
-            self._set_state(AssistantState.WAITING)
+            # Return to WAITING_FOR_CLAP
+            self._set_state(AssistantState.WAITING_FOR_CLAP)
             return {
+                "clap_detected": True,
                 "wake_detected": True,
                 "transcription": "",
                 "intent": "timeout",
@@ -188,7 +225,7 @@ class ActivationController:
                 "final_state": self._state.value,
             }
 
-        # Step 4b: LLM Command Understanding
+        # 5b: LLM Command Understanding
         t_brain_start = time.perf_counter()
         intent = "unknown"
         entity = None
@@ -206,7 +243,7 @@ class ActivationController:
         metrics["llm"] = round(time.perf_counter() - t_brain_start, 3)
 
         if self.dev_mode:
-            print(f"[PROCESSING] Intent: '{intent}', Entity: '{entity}' (took {metrics['llm']}s)")
+            print(f"[LLM] Intent: '{intent}', Entity: '{entity}' (took {metrics['llm']}s)")
 
         # Handle Exit Assistant command
         clean_lower = clean_text.lower().rstrip(".!?,;:").strip()
@@ -225,6 +262,7 @@ class ActivationController:
             metrics["total_interaction"] = round(time.perf_counter() - t_cycle_start, 3)
 
             return {
+                "clap_detected": True,
                 "wake_detected": True,
                 "transcription": clean_text,
                 "intent": "exit_assistant",
@@ -237,7 +275,7 @@ class ActivationController:
             }
 
         # =====================================================================
-        # STATE 5: EXECUTING (Tool Router Vetting & Tool Invocation)
+        # STAGE 6: EXECUTING (Tool Router Vetting & Tool Invocation)
         # =====================================================================
         self._set_state(AssistantState.EXECUTING)
         t_tool_start = time.perf_counter()
@@ -246,28 +284,31 @@ class ActivationController:
 
         if self.dev_mode:
             status_lbl = "SUCCESS" if tool_result.success else "REJECTED/FAILED"
-            print(f"[EXECUTING] Tool: {intent} -> {status_lbl} ({tool_result.message})")
+            print(f"[TOOL] Result: {status_lbl} ({tool_result.message})")
 
         # =====================================================================
-        # STATE 6: RESPONDING (Natural Language Formatting & Piper TTS)
+        # STAGE 7: RESPONDING (Natural Language Formatting & Piper TTS)
         # =====================================================================
         self._set_state(AssistantState.RESPONDING)
         response_text = self.orchestrator._generate_natural_response(intent, entity, tool_result)
 
         t_tts_start = time.perf_counter()
         if self.dev_mode:
-            print(f"[RESPONDING] Speaking: \"{response_text}\"")
+            print(f"[TTS] Response: \"{response_text}\"")
 
         self.orchestrator._speak(response_text)
         metrics["tts"] = round(time.perf_counter() - t_tts_start, 3)
         metrics["total_interaction"] = round(time.perf_counter() - t_cycle_start, 3)
 
         # =====================================================================
-        # CYCLE COMPLETE: Return to WAITING
+        # CYCLE COMPLETE: Return to WAITING_FOR_CLAP
         # =====================================================================
-        self._set_state(AssistantState.WAITING)
+        self._set_state(AssistantState.WAITING_FOR_CLAP)
+        if self.dev_mode:
+            print("[STATE] Waiting for clap...")
 
         return {
+            "clap_detected": True,
             "wake_detected": True,
             "transcription": clean_text,
             "intent": intent,
@@ -281,12 +322,14 @@ class ActivationController:
 
     def execute_with_audio(
         self,
+        clap_audio: Optional[np.ndarray],
         wake_audio: Optional[np.ndarray],
         command_audio: Optional[np.ndarray],
     ) -> Dict[str, Any]:
         """Execute a simulated lifecycle cycle with injected audio arrays for testing.
 
         Args:
+            clap_audio: 16 kHz audio array to feed into ClapDetector.
             wake_audio: 16 kHz audio array to feed into WakeWordDetector.
             command_audio: 16 kHz audio array to feed into SpeechToText.
 
@@ -296,8 +339,34 @@ class ActivationController:
         metrics: Dict[str, float] = {}
         t_cycle_start = time.perf_counter()
 
-        # Step 1: WAITING
-        self._set_state(AssistantState.WAITING)
+        # Step 1: WAITING_FOR_CLAP
+        self._set_state(AssistantState.WAITING_FOR_CLAP)
+        t_clap_start = time.perf_counter()
+        clap_detected = False
+
+        if clap_audio is not None and len(clap_audio) > 0:
+            frame_sz = self.clap_detector.FRAME_SIZE
+            self.clap_detector.reset()
+            for i in range(0, len(clap_audio) - frame_sz, frame_sz):
+                chunk = clap_audio[i : i + frame_sz]
+                is_det, _ = self.clap_detector.process_frame(chunk)
+                if is_det:
+                    clap_detected = True
+                    break
+
+        metrics["clap_detection"] = round(time.perf_counter() - t_clap_start, 3)
+
+        if not clap_detected:
+            return {
+                "clap_detected": False,
+                "wake_detected": False,
+                "should_exit": False,
+                "metrics": metrics,
+                "final_state": self._state.value,
+            }
+
+        # Step 2: WAITING_FOR_WAKE_WORD
+        self._set_state(AssistantState.WAITING_FOR_WAKE_WORD)
         t_wake_start = time.perf_counter()
         wake_detected = False
 
@@ -314,30 +383,33 @@ class ActivationController:
         metrics["wake_detection"] = round(time.perf_counter() - t_wake_start, 3)
 
         if not wake_detected:
+            # Timeout -> Return to WAITING_FOR_CLAP
+            self._set_state(AssistantState.WAITING_FOR_CLAP)
             return {
+                "clap_detected": True,
                 "wake_detected": False,
                 "should_exit": False,
                 "metrics": metrics,
                 "final_state": self._state.value,
             }
 
-        # Step 2: ACTIVATED
+        # Step 3: ACTIVATED
         self._set_state(AssistantState.ACTIVATED)
         t_act_start = time.perf_counter()
         metrics["activation_cue"] = round(time.perf_counter() - t_act_start, 3)
 
-        # Step 3: LISTENING
+        # Step 4: LISTENING
         self._set_state(AssistantState.LISTENING)
-        metrics["command_recording"] = 0.0  # Injected audio
+        metrics["command_recording"] = 0.0
 
-        # Step 4: PROCESSING
+        # Step 5: PROCESSING
         self._set_state(AssistantState.PROCESSING)
         t_stt_start = time.perf_counter()
 
         if command_audio is not None and len(command_audio) > 0:
             try:
                 transcription, _ = self.orchestrator.stt.transcribe(command_audio)
-            except Exception as exc:
+            except Exception:
                 transcription = ""
         else:
             transcription = ""
@@ -354,8 +426,9 @@ class ActivationController:
             metrics["tts"] = round(time.perf_counter() - t_tts, 3)
             metrics["total_interaction"] = round(time.perf_counter() - t_cycle_start, 3)
 
-            self._set_state(AssistantState.WAITING)
+            self._set_state(AssistantState.WAITING_FOR_CLAP)
             return {
+                "clap_detected": True,
                 "wake_detected": True,
                 "transcription": "",
                 "intent": "timeout",
@@ -396,6 +469,7 @@ class ActivationController:
             metrics["tts"] = round(time.perf_counter() - t_tts, 3)
             metrics["total_interaction"] = round(time.perf_counter() - t_cycle_start, 3)
             return {
+                "clap_detected": True,
                 "wake_detected": True,
                 "transcription": clean_text,
                 "intent": "exit_assistant",
@@ -407,13 +481,13 @@ class ActivationController:
                 "final_state": self._state.value,
             }
 
-        # Step 5: EXECUTING
+        # Step 6: EXECUTING
         self._set_state(AssistantState.EXECUTING)
         t_tool = time.perf_counter()
         tool_result = self.orchestrator.router.route_and_execute({"intent": intent, "entity": entity})
         metrics["tool_execution"] = round(time.perf_counter() - t_tool, 3)
 
-        # Step 6: RESPONDING
+        # Step 7: RESPONDING
         self._set_state(AssistantState.RESPONDING)
         response_text = self.orchestrator._generate_natural_response(intent, entity, tool_result)
         t_tts = time.perf_counter()
@@ -421,10 +495,11 @@ class ActivationController:
         metrics["tts"] = round(time.perf_counter() - t_tts, 3)
         metrics["total_interaction"] = round(time.perf_counter() - t_cycle_start, 3)
 
-        # Return to WAITING
-        self._set_state(AssistantState.WAITING)
+        # Return to WAITING_FOR_CLAP
+        self._set_state(AssistantState.WAITING_FOR_CLAP)
 
         return {
+            "clap_detected": True,
             "wake_detected": True,
             "transcription": clean_text,
             "intent": intent,
@@ -437,12 +512,13 @@ class ActivationController:
         }
 
     def run(self, command_duration: float = 4.0) -> None:
-        """Run the continuous wake-word activation loop until interrupted or exit."""
+        """Run the continuous two-stage activation loop until interrupted or exit."""
         print("=" * 65)
-        print("      VROOM AI — Continuous Wake-Word Activation Mode")
+        print("     VROOM AI — Staged Activation Mode (Clap + Wake Word)")
         print("=" * 65)
-        print(f"Wake Phrase : 'Hey Jarvis' (Model: {self.wake_detector.model_name})")
-        print("Status      : Waiting for wake word... Speak to activate.")
+        print("Activation Gate 1: 👏 Physical Acoustic Clap")
+        print(f"Activation Gate 2: Spoken Wake Phrase ('Hey Jarvis', timeout: {self.wake_timeout}s)")
+        print("Status           : [STATE] Waiting for clap...")
         print("=" * 65)
 
         try:
@@ -453,5 +529,5 @@ class ActivationController:
                     break
         except KeyboardInterrupt:
             print("\n[CONTROLLER] Interrupted by user. Exiting cleanly.")
-            self._set_state(AssistantState.WAITING)
+            self._set_state(AssistantState.WAITING_FOR_CLAP)
             self.orchestrator._speak("Goodbye.")
