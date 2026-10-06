@@ -39,8 +39,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--wake-timeout",
         type=float,
-        default=6.0,
-        help="Time in seconds to wait for the wake phrase after a clap (default: 6.0s).",
+        default=8.0,
+        help="Time in seconds to wait for the wake phrase after a clap (default: 8.0s).",
     )
     parser.add_argument(
         "--duration",

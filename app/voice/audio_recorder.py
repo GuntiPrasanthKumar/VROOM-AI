@@ -54,6 +54,9 @@ class AudioRecorder:
         total_frames = int(self.sample_rate * duration_seconds)
 
         try:
+            print("[STT] Starting microphone capture")
+            print(f"[STT] Microphone opened ({self.device_info})")
+            print(f"[STT] Recording for {duration_seconds:.1f}s... Speak now!")
             # sd.rec records asynchronously into a numpy buffer
             raw_audio = sd.rec(
                 frames=total_frames,
@@ -64,6 +67,7 @@ class AudioRecorder:
             )
             # Block until recording finishes
             sd.wait()
+            print(f"[STT] Recording complete ({total_frames} samples captured)")
         except sd.PortAudioError as pa_err:
             raise RuntimeError(
                 f"PortAudio error during recording on device {self.device_info}: {pa_err}"

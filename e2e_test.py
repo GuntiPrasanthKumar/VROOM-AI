@@ -59,10 +59,11 @@ def run_tests() -> bool:
     except Exception as exc:
         print(f"  [WARN] Microphone test encountered: {exc}\n")
 
-    # Clean up any leftover VROOMTest folder from prior runs
-    workspace_test_dir = Path(__file__).resolve().parent / "vroom_workspace" / "VROOMTest"
-    if workspace_test_dir.exists():
-        shutil.rmtree(workspace_test_dir, ignore_errors=True)
+    # Clean up any leftover test folders from prior runs
+    for fld in ["VROOMTest", "Vroom Test", "VroomTest"]:
+        p = Path(__file__).resolve().parent / "vroom_workspace" / fld
+        if p.exists():
+            shutil.rmtree(p, ignore_errors=True)
 
     # Define the test cases
     test_cases = [
@@ -96,7 +97,7 @@ def run_tests() -> bool:
         },
         {
             "id": "TEST 5",
-            "spoken_command": "Quit VROOM",
+            "spoken_command": "Exit assistant",
             "expected_intent": "exit_assistant",
             "expected_entity": None,
             "expected_success": True,

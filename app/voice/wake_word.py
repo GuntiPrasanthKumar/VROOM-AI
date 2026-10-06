@@ -27,7 +27,7 @@ class WakeWordDetector:
     def __init__(
         self,
         model_name: str = "hey_jarvis",
-        threshold: float = 0.5,
+        threshold: float = 0.22,
         debounce_seconds: float = 1.5,
         device_index: Optional[int] = None,
     ) -> None:
@@ -138,6 +138,7 @@ class WakeWordDetector:
         """
         start_time = time.time()
         self.reset()
+        print(f"[WAKE] Listening... (model: '{self.model_name}', threshold: {self.threshold:.2f})")
 
         try:
             with sd.InputStream(
@@ -157,6 +158,7 @@ class WakeWordDetector:
                         on_frame(score)
 
                     if detected:
+                        print(f"\n[WAKE] Detected (confidence: {score:.2f})")
                         return True
 
                     if timeout_seconds is not None:

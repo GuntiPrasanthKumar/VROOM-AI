@@ -21,9 +21,9 @@ class ClapDetector:
         self,
         threshold: float = 0.03,
         min_crest_factor: float = 3.0,
-        min_onset_ratio: float = 3.2,
-        max_decay_ratio: float = 0.60,
-        max_decay_peak: float = 0.28,
+        min_onset_ratio: float = 3.0,
+        max_decay_ratio: float = 0.55,
+        max_decay_peak: float = 0.32,
         debounce_seconds: float = 0.6,
         device_index: Optional[int] = None,
         feedback: bool = True,
@@ -138,6 +138,7 @@ class ClapDetector:
         if (
             not is_clap
             and not self._candidate_pending
+            and self._prev_rms < 0.035
             and peak_amp >= effective_threshold
             and crest_factor >= self.min_crest_factor
             and onset_ratio >= self.min_onset_ratio
@@ -171,6 +172,9 @@ class ClapDetector:
         candidate_active = False
         last_meter_time = 0.0
 
+        if self.feedback:
+            print("[CLAP] Listening...")
+
         try:
             with sd.InputStream(
                 samplerate=self.SAMPLE_RATE,
@@ -190,22 +194,22 @@ class ClapDetector:
                     if self.feedback:
                         peak = metrics["peak"]
                         if is_clap:
-                            print(f"\r[CLAP] Physical clap detected! (Peak: {peak:.3f}, Crest: {metrics['crest_factor']:.1f}){' '*25}\n", flush=True)
+                            print(f"\r[CLAP] Detected (Peak: {peak:.3f}, Crest: {metrics['crest_factor']:.1f}){' '*25}\n", flush=True)
                             candidate_active = False
                         elif self._candidate_pending:
-                            print(f"\r[MIC] Sharp transient caught (Peak: {peak:.3f}) --> Checking decay...{' '*15}", end="", flush=True)
+                            print(f"\r[CLAP] Transient caught (Peak: {peak:.3f}) --> Checking decay...{' '*15}", end="", flush=True)
                             candidate_active = True
                         elif candidate_active:
                             # Candidate check completed in 32ms and was rejected: immediately clear the prompt!
                             candidate_active = False
-                            print(f"\r[STATE] Waiting for clap...{' '*50}", end="", flush=True)
+                            print(f"\r[CLAP] Listening...{' '*50}", end="", flush=True)
                         elif peak > 0.015 and (now - last_meter_time) > 0.15:
                             last_meter_time = now
                             bar = "#" * int(min(peak * 120, 20))
-                            print(f"\r[STATE] Waiting for clap... [Audio: {peak:.3f} {bar:<20}]", end="", flush=True)
+                            print(f"\r[CLAP] Listening... [Audio: {peak:.3f} {bar:<20}]", end="", flush=True)
                         elif (now - last_meter_time) > 0.8:
                             last_meter_time = now
-                            print(f"\r[STATE] Waiting for clap...{' '*40}", end="", flush=True)
+                            print(f"\r[CLAP] Listening...{' '*40}", end="", flush=True)
 
                     if is_clap:
                         return True

@@ -81,6 +81,12 @@ def run_tests() -> bool:
     synth_exit, sr_ex = tts.synthesize("Exit assistant")
     cmd_exit_16k = resample_to_16k(synth_exit, orig_sr=sr_ex)
 
+    synth_sleep, sr_sl = tts.synthesize("go to sleep")
+    cmd_sleep_16k = resample_to_16k(synth_sleep, orig_sr=sr_sl)
+
+    synth_goodbye, sr_gb = tts.synthesize("goodbye")
+    cmd_goodbye_16k = resample_to_16k(synth_goodbye, orig_sr=sr_gb)
+
     # Pure silence
     silence_audio = np.zeros(32000, dtype=np.float32)
 
@@ -95,6 +101,7 @@ def run_tests() -> bool:
             "expect_tool_success": True,
             "expect_final_state": AssistantState.WAITING_FOR_CLAP.value,
             "expect_exit": False,
+            "expect_turn_count": 1,
             "description": "Gate 1 (Clap) and Gate 2 (Wake) satisfied -> Launches Notepad -> returns to WAITING_FOR_CLAP.",
         },
         {
@@ -131,6 +138,7 @@ def run_tests() -> bool:
             "expect_tool_success": False,
             "expect_final_state": AssistantState.WAITING_FOR_CLAP.value,
             "expect_exit": False,
+            "expect_turn_count": 1,
             "description": "Both gates satisfied, but command is dangerous -> Tool Router rejects -> returns to WAITING_FOR_CLAP.",
         },
         {
@@ -143,6 +151,7 @@ def run_tests() -> bool:
             "expect_tool_success": True,
             "expect_final_state": AssistantState.WAITING_FOR_CLAP.value,
             "expect_exit": False,
+            "expect_turn_count": 1,
             "description": "Subsequent consecutive cycle in same instance -> Launches Chrome -> WAITING_FOR_CLAP.",
         },
         {
@@ -155,7 +164,47 @@ def run_tests() -> bool:
             "expect_tool_success": None,
             "expect_final_state": AssistantState.RESPONDING.value,
             "expect_exit": True,
+            "expect_turn_count": 1,
             "description": "Consecutive exit cycle in same instance -> Sets should_exit=True -> Clean shutdown.",
+        },
+        {
+            "id": "TEST 6: Multi-turn Continuous Session (Notepad -> Chrome -> Sleep)",
+            "clap_audio": clap_audio,
+            "wake_audio": padded_wake_16k,
+            "command_audio": [cmd_notepad_16k, cmd_chrome_16k, cmd_sleep_16k],
+            "expect_clap": True,
+            "expect_wake": True,
+            "expect_tool_success": None,
+            "expect_final_state": AssistantState.WAITING_FOR_CLAP.value,
+            "expect_exit": False,
+            "expect_turn_count": 3,
+            "description": "Clap -> Wake -> Turn 1 (Notepad) -> Turn 2 (Chrome, no clap/wake) -> Turn 3 ('go to sleep' termination) -> WAITING_FOR_CLAP.",
+        },
+        {
+            "id": "TEST 7: Follow-up Continuous Session (Notepad -> Goodbye)",
+            "clap_audio": clap_audio,
+            "wake_audio": padded_wake_16k,
+            "command_audio": [cmd_notepad_16k, cmd_goodbye_16k],
+            "expect_clap": True,
+            "expect_wake": True,
+            "expect_tool_success": None,
+            "expect_final_state": AssistantState.WAITING_FOR_CLAP.value,
+            "expect_exit": False,
+            "expect_turn_count": 2,
+            "description": "Immediately re-activates with Clap + Wake -> Turn 1 (Notepad) -> Turn 2 ('goodbye' termination) -> WAITING_FOR_CLAP.",
+        },
+        {
+            "id": "TEST 8: Continuous Session Timeout (Chrome -> Silence)",
+            "clap_audio": clap_audio,
+            "wake_audio": padded_wake_16k,
+            "command_audio": [cmd_chrome_16k, silence_audio],
+            "expect_clap": True,
+            "expect_wake": True,
+            "expect_tool_success": None,
+            "expect_final_state": AssistantState.WAITING_FOR_CLAP.value,
+            "expect_exit": False,
+            "expect_turn_count": 2,
+            "description": "Clap -> Wake -> Turn 1 (Chrome) -> Turn 2 (Silence/timeout) -> enters standby -> WAITING_FOR_CLAP.",
         },
     ]
 
@@ -214,7 +263,16 @@ def run_tests() -> bool:
                 print(f"  Tool Security     : [FAIL] Expected tool rejection, got {tool_res}")
                 passed = False
 
-        # 4. Final state check
+        # 4. Turn count check
+        if "expect_turn_count" in test and test["expect_turn_count"] is not None:
+            actual_turns = outcome.get("turn_count", 1)
+            if actual_turns == test["expect_turn_count"]:
+                print(f"  Turn Count Check  : OK (turn_count={actual_turns})")
+            else:
+                print(f"  Turn Count Check  : [FAIL] Expected {test['expect_turn_count']}, got {actual_turns}")
+                passed = False
+
+        # 5. Final state check
         final_state = outcome.get("final_state")
         if final_state == test["expect_final_state"]:
             print(f"  Final State Check : OK (State: {final_state})")
@@ -222,7 +280,7 @@ def run_tests() -> bool:
             print(f"  Final State Check : [FAIL] Expected {test['expect_final_state']}, got {final_state}")
             passed = False
 
-        # 5. Exit flag check
+        # 6. Exit flag check
         if outcome.get("should_exit") == test["expect_exit"]:
             print(f"  Exit Flag Check   : OK (should_exit={outcome.get('should_exit')})")
         else:
