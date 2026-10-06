@@ -65,15 +65,15 @@ def main() -> int:
     dev_mode = not args.quiet
 
     print("=" * 65)
-    print("        VROOM AI — Intelligent Desktop Voice Assistant")
+    print("        VROOM AI - Intelligent Desktop Voice Assistant")
     print("=" * 65)
     print(f"Python Runtime : {platform.python_version()} on {platform.system()} {platform.release()}")
     if mode == "staged":
-        print("Activation 1   : 👏 Physical Acoustic Clap Detector [Local, Calibrated]")
-        print(f"Activation 2   : 🗣️ OpenWakeWord ('Hey Jarvis', timeout: {args.wake_timeout}s) [Local]")
+        print("Activation 1   : [CLAP] Physical Acoustic Clap Detector [Local, Calibrated]")
+        print(f"Activation 2   : [VOICE] OpenWakeWord ('Hey Jarvis', timeout: {args.wake_timeout}s) [Local]")
         print("Lifecycle Mode : Staged (CLAP -> WAKE -> LISTEN -> EXECUTE -> CLAP)")
     else:
-        print("Activation Gate: 🗣️ OpenWakeWord ('Hey Jarvis') [Direct Wake Mode]")
+        print("Activation Gate: [VOICE] OpenWakeWord ('Hey Jarvis') [Direct Wake Mode]")
         print("Lifecycle Mode : Wake-Only (WAKE -> LISTEN -> EXECUTE -> WAKE)")
     print("Brain Engine   : Ollama (llama3.2:1b) [Local]")
     print("Speech-to-Text : Faster-Whisper (base, int8) [Local]")

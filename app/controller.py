@@ -86,7 +86,7 @@ class ActivationController:
         old_state = self._state
         self._state = new_state
         if self.dev_mode:
-            print(f"\n[STATE] {old_state.value} ──> {new_state.value}")
+            print(f"\n[STATE] {old_state.value} --> {new_state.value}")
         if self.on_state_change is not None:
             self.on_state_change(old_state, new_state)
 
@@ -183,7 +183,7 @@ class ActivationController:
                 "final_state": self._state.value,
             }
 
-        print(f"\r[WAKE] Wake phrase detected! 🎯{' '*35}\n", flush=True)
+        print(f"\r[WAKE] Wake phrase detected! [CONFIRMED]{' '*35}\n", flush=True)
 
         # =====================================================================
         # STAGE 3: ACTIVATED (Double gate satisfied, prepare command capture)
@@ -544,15 +544,15 @@ class ActivationController:
         """Run the continuous activation loop until interrupted or exit."""
         print("=" * 65)
         if self.mode == "wake_only":
-            print("     VROOM AI — Direct Wake-Word Mode ('Hey Jarvis')")
+            print("     VROOM AI - Direct Wake-Word Mode ('Hey Jarvis')")
             print("=" * 65)
-            print("Activation Gate  : 🗣️ Spoken Wake Phrase ('Hey Jarvis')")
+            print("Activation Gate  : [VOICE] Spoken Wake Phrase ('Hey Jarvis')")
             print("Standby Status   : [STATE] Waiting for 'Hey Jarvis'...")
         else:
-            print("     VROOM AI — Staged Activation Mode (Clap + Wake Word)")
+            print("     VROOM AI - Staged Activation Mode (Clap + Wake Word)")
             print("=" * 65)
-            print("Activation Gate 1: 👏 Physical Acoustic Clap")
-            print(f"Activation Gate 2: 🗣️ Spoken Wake Phrase ('Hey Jarvis', timeout: {self.wake_timeout}s)")
+            print("Activation Gate 1: [CLAP] Physical Acoustic Clap")
+            print(f"Activation Gate 2: [VOICE] Spoken Wake Phrase ('Hey Jarvis', timeout: {self.wake_timeout}s)")
             print("Standby Status   : [STATE] Waiting for clap...")
         print("=" * 65)
 

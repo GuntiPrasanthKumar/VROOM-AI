@@ -190,10 +190,10 @@ class ClapDetector:
                     if self.feedback:
                         peak = metrics["peak"]
                         if is_clap:
-                            print(f"\r[CLAP] 👏 Physical clap detected! (Peak: {peak:.3f}, Crest: {metrics['crest_factor']:.1f}){' '*25}\n", flush=True)
+                            print(f"\r[CLAP] Physical clap detected! (Peak: {peak:.3f}, Crest: {metrics['crest_factor']:.1f}){' '*25}\n", flush=True)
                             candidate_active = False
                         elif self._candidate_pending:
-                            print(f"\r[MIC] Sharp transient caught (Peak: {peak:.3f}) ──> Checking decay...{' '*15}", end="", flush=True)
+                            print(f"\r[MIC] Sharp transient caught (Peak: {peak:.3f}) --> Checking decay...{' '*15}", end="", flush=True)
                             candidate_active = True
                         elif candidate_active:
                             # Candidate check completed in 32ms and was rejected: immediately clear the prompt!
