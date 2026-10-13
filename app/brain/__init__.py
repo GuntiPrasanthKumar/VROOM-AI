@@ -9,6 +9,12 @@ from app.brain.task_planner import (
     TaskPlan,
     TaskPlanner,
 )
+from app.brain.task_verifier import (
+    StateObserver,
+    TaskVerifier,
+    VerificationResult,
+    VerificationStatus,
+)
 
 __all__ = [
     "CommandParser",
@@ -19,5 +25,10 @@ __all__ = [
     "PlanStep",
     "PlanExecutionReport",
     "StepStatus",
+    "TaskVerifier",
+    "StateObserver",
+    "VerificationResult",
+    "VerificationStatus",
 ]
+
 

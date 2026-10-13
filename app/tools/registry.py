@@ -7,7 +7,7 @@ from typing import Dict, List, Optional
 from app.tools.base import BaseTool
 from app.tools.desktop import OpenApplicationTool
 from app.tools.browser import OpenWebsiteTool
-from app.tools.filesystem import CreateFolderTool
+from app.tools.filesystem import CreateFileTool, CreateFolderTool
 
 
 class ToolRegistry:
@@ -23,6 +23,7 @@ class ToolRegistry:
         self.register_tool(OpenApplicationTool())
         self.register_tool(OpenWebsiteTool())
         self.register_tool(CreateFolderTool())
+        self.register_tool(CreateFileTool())
 
     def register_tool(self, tool: BaseTool) -> None:
         """Register an approved tool under its canonical intent name.

@@ -25,6 +25,12 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from app.brain.command_parser import CommandParser, ParsedCommand
 from app.brain.llm_client import OllamaClient
+from app.brain.task_verifier import (
+    StateObserver,
+    TaskVerifier,
+    VerificationResult,
+    VerificationStatus,
+)
 from app.tools.base import ToolResult
 from app.tools.registry import ToolRegistry
 from app.tools.router import ToolRouter
@@ -54,6 +60,9 @@ class PlanStep:
         status: Current execution status.
         result: ToolResult returned after execution (if attempted).
         error: Detailed error message if step failed or was rejected.
+        verification: Independent outcome verification result.
+        recovery_attempted: Whether a safe recovery was attempted.
+        recovery_result: Description of recovery outcome.
     """
 
     step_number: int
@@ -63,6 +72,9 @@ class PlanStep:
     status: StepStatus = StepStatus.PENDING
     result: Optional[ToolResult] = None
     error: Optional[str] = None
+    verification: Optional[VerificationResult] = None
+    recovery_attempted: bool = False
+    recovery_result: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize plan step to a standard dictionary."""
@@ -74,6 +86,9 @@ class PlanStep:
             "status": self.status.value,
             "result": self.result.to_dict() if self.result else None,
             "error": self.error,
+            "verification": self.verification.to_dict() if self.verification else None,
+            "recovery_attempted": self.recovery_attempted,
+            "recovery_result": self.recovery_result,
         }
 
 
@@ -178,6 +193,8 @@ class TaskPlanner:
         llm: Optional[OllamaClient] = None,
         parser: Optional[CommandParser] = None,
         registry: Optional[ToolRegistry] = None,
+        verifier: Optional[TaskVerifier] = None,
+        observer: Optional[StateObserver] = None,
         dev_mode: bool = True,
     ) -> None:
         """Initialize the task planner.
@@ -187,6 +204,8 @@ class TaskPlanner:
             llm: OllamaClient for LLM-based natural language decomposition.
             parser: CommandParser for deterministic clause understanding.
             registry: ToolRegistry for schema and intent inspection.
+            verifier: TaskVerifier for independent outcome validation.
+            observer: StateObserver for read-only desktop observation.
             dev_mode: Whether to print diagnostic development output.
         """
         self.dev_mode = dev_mode
@@ -194,6 +213,8 @@ class TaskPlanner:
         self.router = router or ToolRouter(self.registry)
         self.llm = llm or OllamaClient()
         self.parser = parser or CommandParser()
+        self.observer = observer or StateObserver(dev_mode=dev_mode)
+        self.verifier = verifier or TaskVerifier(observer=self.observer, dev_mode=dev_mode)
 
     def is_multi_step_request(self, text: str) -> bool:
         """Determine if a text command contains compound multi-step actions.
@@ -504,7 +525,7 @@ class TaskPlanner:
         return (len(errors) == 0), errors
 
     def execute_plan(self, plan: TaskPlan) -> PlanExecutionReport:
-        """Sequentially execute a validated TaskPlan one step at a time.
+        """Sequentially execute a validated TaskPlan using OBSERVE -> ACT -> OBSERVE -> VERIFY -> RECOVER.
 
         Halts immediately on the first failure or unsupported step, marks remaining
         steps as SKIPPED, and generates an accurate outcome report.
@@ -532,6 +553,13 @@ class TaskPlanner:
             if not is_valid:
                 step.status = StepStatus.FAILED
                 step.error = validation_error
+                step.verification = VerificationResult(
+                    status=VerificationStatus.FAILED,
+                    expected_outcome=f"Validate action '{step.action}'",
+                    actual_evidence={"validation_error": validation_error},
+                    explanation=validation_error or "Validation failed",
+                    safe_recovery_available=False,
+                )
                 report.failed_steps.append(step)
                 report.stop_reason = f"Step {step.step_number} failed validation: {validation_error}"
                 if self.dev_mode:
@@ -544,7 +572,10 @@ class TaskPlanner:
                     report.skipped_steps.append(remaining_step)
                 break
 
-            # 2. Sequential Execution via ToolRouter
+            # 2. Pre-Action Observation (Capture environment state before action)
+            pre_state = self.observer.observe_pre_state(step.action, step.entity)
+
+            # 3. Sequential Execution via ToolRouter
             step_cmd = {"intent": step.action, "entity": step.entity}
             try:
                 tool_result = self.router.route_and_execute(step_cmd)
@@ -556,19 +587,84 @@ class TaskPlanner:
 
             step.result = tool_result
 
-            # 3. Verify Execution Result
-            if tool_result.success:
+            # 4. Post-Action Observation (Capture environment state after action)
+            post_state = self.observer.observe_post_state(step.action, step.entity)
+
+            # 5. Independent Verification
+            verification = self.verifier.verify(
+                step.action,
+                step.entity,
+                tool_result,
+                pre_state,
+                post_state,
+            )
+            step.verification = verification
+
+            # 6. Evaluate Outcome and Safe Recovery
+            # Succeeded if tool succeeded AND verification is VERIFIED or UNKNOWN (e.g. browser URL dispatch)
+            step_succeeded = tool_result.success and verification.status in (
+                VerificationStatus.VERIFIED,
+                VerificationStatus.UNKNOWN,
+            )
+
+            if step_succeeded:
                 step.status = StepStatus.COMPLETED
                 report.completed_steps.append(step)
                 if self.dev_mode:
-                    print(f"  [SUCCESS] {tool_result.message}")
+                    status_lbl = "VERIFIED" if verification.status == VerificationStatus.VERIFIED else "UNKNOWN"
+                    print(f"  [{status_lbl}] {verification.explanation}")
             else:
-                step.status = StepStatus.FAILED
-                step.error = tool_result.message
-                report.failed_steps.append(step)
-                report.stop_reason = f"Step {step.step_number} failed: {tool_result.message}"
-                if self.dev_mode:
-                    print(f"  [FAILED] {report.stop_reason}")
+                # Execution or verification failed — Evaluate controlled recovery
+                if verification.safe_recovery_available and not step.recovery_attempted:
+                    step.recovery_attempted = True
+                    step.recovery_result = "Recovery attempt 1 in progress..."
+                    if self.dev_mode:
+                        print(f"  [RECOVERY] Attempting 1 safe recovery for step {step.step_number} ({step.action} -> {step.entity})...")
+
+                    # Re-observe pre-state
+                    pre_retry = self.observer.observe_pre_state(step.action, step.entity)
+                    try:
+                        retry_result = self.router.route_and_execute(step_cmd)
+                    except Exception as exc:
+                        retry_result = ToolResult(success=False, message=f"Recovery error: {exc}")
+                    step.result = retry_result
+
+                    # Re-observe post-state
+                    post_retry = self.observer.observe_post_state(step.action, step.entity)
+                    retry_verification = self.verifier.verify(
+                        step.action,
+                        step.entity,
+                        retry_result,
+                        pre_retry,
+                        post_retry,
+                    )
+                    step.verification = retry_verification
+
+                    if retry_result.success and retry_verification.status in (
+                        VerificationStatus.VERIFIED,
+                        VerificationStatus.UNKNOWN,
+                    ):
+                        step.recovery_result = "Recovered successfully on retry 1."
+                        step.status = StepStatus.COMPLETED
+                        report.completed_steps.append(step)
+                        if self.dev_mode:
+                            print(f"  [RECOVERY SUCCESS] Step {step.step_number} recovered and verified.")
+                        continue
+                    else:
+                        step.recovery_result = f"Recovery attempt 1 failed: {retry_verification.explanation}"
+                        step.status = StepStatus.FAILED
+                        step.error = retry_verification.explanation or retry_result.message
+                        report.failed_steps.append(step)
+                        report.stop_reason = f"Step {step.step_number} failed after recovery attempt: {step.error}"
+                        if self.dev_mode:
+                            print(f"  [RECOVERY FAILED] {report.stop_reason}")
+                else:
+                    step.status = StepStatus.FAILED
+                    step.error = verification.explanation or tool_result.message
+                    report.failed_steps.append(step)
+                    report.stop_reason = f"Step {step.step_number} failed verification: {step.error}"
+                    if self.dev_mode:
+                        print(f"  [VERIFICATION FAILED] {report.stop_reason}")
 
                 # Mark all subsequent steps as SKIPPED
                 for remaining_step in plan.steps[i + 1 :]:
@@ -645,6 +741,8 @@ class TaskPlanner:
                     return f"I cannot open {step.entity}. That application is not in the approved allowlist."
                 if "not a supported tool" in err_msg or "does not map" in err_msg or "not supported" in err_msg:
                     return f"I cannot perform that action. {step.action} is not a supported tool."
+                if step.verification and step.verification.status == VerificationStatus.FAILED:
+                    return f"Action '{step.action}' failed verification: {step.verification.explanation}"
                 return f"I was unable to complete {step.action}: {err_msg}"
 
         # Case 2: Multi-step command — All steps succeeded

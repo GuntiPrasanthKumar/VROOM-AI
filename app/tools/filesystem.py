@@ -102,3 +102,90 @@ class CreateFolderTool(BaseTool):
                 message=f"Failed to create folder '{folder_name}': {exc}",
                 data={"error": str(exc)},
             )
+
+
+class CreateFileTool(BaseTool):
+    """Tool to safely create a text file strictly inside the sandboxed VROOM workspace."""
+
+    name: str = "create_file"
+    description: str = "Creates a new file inside the sandboxed VROOM workspace directory."
+
+    INVALID_CHARS_PATTERN = re.compile(r'[<>:"/\\|?*]')
+
+    def __init__(self, workspace_root: Optional[Path] = None) -> None:
+        """Initialize with a sandboxed workspace directory."""
+        if workspace_root is None:
+            self.workspace_root = Path(__file__).resolve().parent.parent.parent / "vroom_workspace"
+        else:
+            self.workspace_root = workspace_root.resolve()
+
+        self.workspace_root.mkdir(parents=True, exist_ok=True)
+
+    def execute(self, entity: Optional[str]) -> ToolResult:
+        """Validate the file name and create it inside the sandbox."""
+        if not entity or not entity.strip():
+            return ToolResult(
+                success=False,
+                message="Rejected: File name must not be empty.",
+            )
+
+        file_name = entity.strip()
+
+        # Security Check 1: No path separators
+        if "/" in file_name or "\\" in file_name:
+            return ToolResult(
+                success=False,
+                message=f"Rejected: File name '{file_name}' contains path separators. Sub-paths and absolute paths are forbidden.",
+                data={"rejected_entity": file_name},
+            )
+
+        # Security Check 2: No illegal Windows characters
+        if self.INVALID_CHARS_PATTERN.search(file_name):
+            return ToolResult(
+                success=False,
+                message=f"Rejected: File name '{file_name}' contains illegal Windows characters (< > : \" / \\ | ? *).",
+                data={"rejected_entity": file_name},
+            )
+
+        # Security Check 3: No path traversal tricks
+        if file_name in (".", "..") or file_name.startswith(".."):
+            return ToolResult(
+                success=False,
+                message=f"Rejected: Path traversal sequence detected in '{file_name}'.",
+                data={"rejected_entity": file_name},
+            )
+
+        # Security Check 4: Sandbox Escape Verification
+        target_path = (self.workspace_root / file_name).resolve()
+        try:
+            target_path.relative_to(self.workspace_root)
+        except ValueError:
+            return ToolResult(
+                success=False,
+                message=f"Rejected: Sandbox violation. Target '{target_path}' is outside the VROOM workspace.",
+                data={"rejected_path": str(target_path)},
+            )
+
+        # Security Check 5: No overwriting
+        if target_path.exists():
+            return ToolResult(
+                success=False,
+                message=f"Rejected: File '{file_name}' already exists in workspace.",
+                data={"path": str(target_path)},
+            )
+
+        # Safe execution: Create the empty file
+        try:
+            target_path.touch(exist_ok=False)
+            return ToolResult(
+                success=True,
+                message=f"Successfully created file: {file_name} (in {self.workspace_root})",
+                data={"file_name": file_name, "full_path": str(target_path)},
+            )
+        except Exception as exc:
+            return ToolResult(
+                success=False,
+                message=f"Failed to create file '{file_name}': {exc}",
+                data={"error": str(exc)},
+            )
+

@@ -61,6 +61,8 @@ class AssistantOrchestrator:
             registry=self.router.registry,
             dev_mode=self.dev_mode,
         )
+        self.observer = self.planner.observer
+        self.verifier = self.planner.verifier
 
         # Initialize voice output subsystem (Piper TTS)
         self.tts = tts or TextToSpeech()
@@ -70,6 +72,7 @@ class AssistantOrchestrator:
         intent: str,
         entity: Optional[str],
         tool_result: Optional[ToolResult],
+        verification: Optional[Any] = None,
     ) -> str:
         """Convert a structured tool outcome into a natural, conversational response."""
         entity_name = entity or "the requested item"
@@ -77,6 +80,15 @@ class AssistantOrchestrator:
         # Handle exit intent
         if intent == "exit_assistant":
             return "Goodbye! Have a great day."
+
+        # Handle failed verification despite tool reporting success
+        if (
+            verification is not None
+            and getattr(verification, "status", None) == "FAILED"
+            and tool_result
+            and tool_result.success
+        ):
+            return f"I attempted to open {entity_name}, but could not verify that it is running."
 
         # Handle tool execution results
         if tool_result is not None:
@@ -87,6 +99,8 @@ class AssistantOrchestrator:
                     return f"Opening {entity_name} now."
                 elif intent == "create_folder":
                     return f"Folder {entity_name} has been created in your workspace."
+                elif intent == "create_file":
+                    return f"File {entity_name} has been created in your workspace."
                 return tool_result.message
 
             # Unsuccessful tool execution
@@ -240,7 +254,7 @@ class AssistantOrchestrator:
                 "plan_report": plan_report,
             }
 
-        # Step 3: Route & Execute Tool (Single Action)
+        # Step 3: Route & Execute Tool (Single Action with Observe -> Act -> Observe -> Verify)
         t_tool_start = time.perf_counter()
         tool_result: ToolResult
 
@@ -248,8 +262,17 @@ class AssistantOrchestrator:
             print("\n[ROUTER]")
             print(f"  Routing Intent: {intent}")
 
+        # Pre-action observation
+        pre_state = self.observer.observe_pre_state(intent, entity)
+
         # Dispatch command dict to router
         tool_result = self.router.route_and_execute({"intent": intent, "entity": entity})
+
+        # Post-action observation
+        post_state = self.observer.observe_post_state(intent, entity)
+
+        # Independent verification
+        verification = self.verifier.verify(intent, entity, tool_result, pre_state, post_state)
         latencies["tool"] = round(time.perf_counter() - t_tool_start, 3)
 
         if self.dev_mode:
@@ -257,10 +280,11 @@ class AssistantOrchestrator:
             status_label = "SUCCESS" if tool_result.success else "REJECTED/FAILED"
             print(f"  Result: {status_label}")
             print(f"  Message: {tool_result.message}")
+            print(f"  Verification: {verification.status.value} ({verification.explanation})")
             print(f"  Latency: {latencies['tool']}s")
 
         # Step 4: Natural Response Generation
-        response = self._generate_natural_response(intent, entity, tool_result)
+        response = self._generate_natural_response(intent, entity, tool_result, verification)
 
         # Step 5: Text-to-Speech Output
         t_tts_start = time.perf_counter()
@@ -287,6 +311,7 @@ class AssistantOrchestrator:
             "intent": intent,
             "entity": entity,
             "tool_result": tool_result,
+            "verification": verification,
             "response": response,
             "should_exit": False,
             "latencies": latencies,
