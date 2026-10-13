@@ -14,6 +14,7 @@ from app.voice.speech_to_text import SpeechToText
 from app.voice.text_to_speech import TextToSpeech
 from app.brain.command_parser import CommandParser, ParsedCommand
 from app.brain.llm_client import OllamaClient
+from app.brain.task_planner import TaskPlan, TaskPlanner
 from app.tools.base import ToolResult
 from app.tools.registry import ToolRegistry
 from app.tools.router import ToolRouter
@@ -30,6 +31,7 @@ class AssistantOrchestrator:
         llm: Optional[OllamaClient] = None,
         router: Optional[ToolRouter] = None,
         tts: Optional[TextToSpeech] = None,
+        planner: Optional[TaskPlanner] = None,
         dev_mode: bool = True,
     ) -> None:
         """Initialize the assistant orchestrator with all necessary subsystems.
@@ -50,6 +52,15 @@ class AssistantOrchestrator:
 
         # Initialize tool execution subsystem
         self.router = router or ToolRouter(ToolRegistry())
+
+        # Initialize multi-step task planning engine
+        self.planner = planner or TaskPlanner(
+            router=self.router,
+            llm=self.llm,
+            parser=self.parser,
+            registry=self.router.registry,
+            dev_mode=self.dev_mode,
+        )
 
         # Initialize voice output subsystem (Piper TTS)
         self.tts = tts or TextToSpeech()
@@ -189,7 +200,47 @@ class AssistantOrchestrator:
                 "latencies": latencies,
             }
 
-        # Step 3: Route & Execute Tool
+        # Step 2b: Multi-Step Task Planning Engine (if compound request)
+        if self.planner.is_multi_step_request(clean_text):
+            t_plan_start = time.perf_counter()
+            if self.dev_mode:
+                print("\n[PLANNER] Detected compound request. Generating multi-step task plan...")
+
+            plan_report = self.planner.plan_and_execute(clean_text)
+            latencies["planner"] = round(time.perf_counter() - t_plan_start, 3)
+            response = plan_report.summary_message
+
+            t_tts_start = time.perf_counter()
+            if self.dev_mode:
+                print("\n[TTS]")
+                print(f"  Response: {response}")
+
+            self._speak(response)
+            latencies["tts"] = round(time.perf_counter() - t_tts_start, 3)
+            latencies["total"] = round(time.perf_counter() - t_total_start, 3)
+
+            primary_step = plan_report.plan.steps[0] if plan_report.plan.steps else None
+            primary_intent = primary_step.action if primary_step else "multi_step"
+            primary_entity = primary_step.entity if primary_step else None
+            last_result = (
+                plan_report.completed_steps[-1].result
+                if plan_report.completed_steps
+                else (plan_report.failed_steps[-1].result if plan_report.failed_steps else None)
+            )
+
+            return {
+                "transcription": clean_text,
+                "intent": primary_intent,
+                "entity": primary_entity,
+                "tool_result": last_result,
+                "response": response,
+                "should_exit": False,
+                "latencies": latencies,
+                "plan": plan_report.plan,
+                "plan_report": plan_report,
+            }
+
+        # Step 3: Route & Execute Tool (Single Action)
         t_tool_start = time.perf_counter()
         tool_result: ToolResult
 

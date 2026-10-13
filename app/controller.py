@@ -367,7 +367,54 @@ class ActivationController:
                 session_active = False
                 break
 
-            # 4f: EXECUTING (Regular tool execution)
+            # 4e.2: Check for Multi-Step Planning Request
+            if self.orchestrator.planner.is_multi_step_request(clean_text):
+                self._set_state(AssistantState.EXECUTING)
+                if self.dev_mode:
+                    print(f"[PLANNER] Decomposing multi-step command: \"{clean_text}\"")
+                t_plan_start = time.perf_counter()
+                plan_report = self.orchestrator.planner.plan_and_execute(clean_text)
+                t_plan_dur = round(time.perf_counter() - t_plan_start, 3)
+
+                # 4g: RESPONDING
+                self._set_state(AssistantState.RESPONDING)
+                response_text = plan_report.summary_message
+                t_tts_start = time.perf_counter()
+                print(f"[TTS] Speaking response: \"{response_text}\"")
+                self.orchestrator._speak(response_text)
+                print("[TTS] Playback complete")
+                t_tts_dur = round(time.perf_counter() - t_tts_start, 3)
+
+                primary_step = plan_report.plan.steps[0] if plan_report.plan.steps else None
+                primary_intent = primary_step.action if primary_step else "multi_step"
+                primary_entity = primary_step.entity if primary_step else None
+                last_result = (
+                    plan_report.completed_steps[-1].result
+                    if plan_report.completed_steps
+                    else (plan_report.failed_steps[-1].result if plan_report.failed_steps else None)
+                )
+
+                session_turns.append({
+                    "turn": turn_count,
+                    "transcription": clean_text,
+                    "intent": primary_intent,
+                    "entity": primary_entity,
+                    "tool_result": last_result,
+                    "response": response_text,
+                    "plan": plan_report.plan,
+                    "plan_report": plan_report,
+                    "latencies": {
+                        "recording": t_rec_dur,
+                        "stt": t_stt_dur,
+                        "brain": t_brain_dur,
+                        "tool": t_plan_dur,
+                        "tts": t_tts_dur,
+                    },
+                })
+                time.sleep(0.08)
+                continue
+
+            # 4f: EXECUTING (Regular single-tool execution)
             self._set_state(AssistantState.EXECUTING)
             print(f"[ROUTER] Routing intent '{intent}'...")
             t_tool_start = time.perf_counter()
